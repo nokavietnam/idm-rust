@@ -33,10 +33,16 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs::File;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+/// Size of the per-segment [`BufWriter`] buffer (256 KiB).
+///
+/// A larger buffer reduces the number of syscalls by batching many small
+/// network chunks into fewer, larger disk writes.
+const WRITE_BUFFER_SIZE: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // Progress channel
@@ -320,21 +326,13 @@ pub async fn download(
 
     let state = Arc::new(Mutex::new(state));
 
-    // ----- 3. Open / pre-allocate file ------------------------------------
+    // ----- 3. Pre-allocate file (new downloads only) -----------------------
     let path = Path::new(&filename);
-    let file = if resuming {
-        // Open existing file for writing without truncating.
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .await?
-    } else {
+    if !resuming {
         let f = File::create(path).await?;
         f.set_len(total_size).await?;
-        f
-    };
-
-    let file = Arc::new(Mutex::new(file));
+        // File handle is dropped here — each segment opens its own.
+    }
 
     // Snapshot segments so we can iterate without holding the lock.
     let segments: Vec<(usize, SegmentState)> = {
@@ -351,6 +349,10 @@ pub async fn download(
     .progress_chars("█▓▒░  ");
 
     // ----- 5. Spawn concurrent segment tasks ------------------------------
+    //
+    // Each segment opens its OWN file handle wrapped in a BufWriter.
+    // This eliminates all mutex contention on the file and lets the OS
+    // schedule writes independently per segment.
     let mut handles = Vec::new();
 
     for (i, seg) in &segments {
@@ -361,13 +363,12 @@ pub async fn download(
 
         let client = client.clone();
         let url = url.to_owned();
-        let file = Arc::clone(&file);
+        let filepath = path.to_path_buf();
         let state = Arc::clone(&state);
         let cancel = cancel.clone();
         let seg = seg.clone();
         let idx = *i;
 
-        let remaining = seg.remaining();
         let pb = multi.add(ProgressBar::new(seg.end - seg.start + 1));
         pb.set_style(style.clone());
         pb.set_message(format!("{}", idx + 1));
@@ -376,7 +377,7 @@ pub async fn download(
 
         let ptx = progress_tx.clone();
         let handle = tokio::spawn(async move {
-            download_segment(&client, &url, &file, &state, &seg, idx, &pb, &cancel, ptx)
+            download_segment(&client, &url, &filepath, &state, &seg, idx, &pb, &cancel, ptx)
                 .await
         });
 
@@ -440,13 +441,17 @@ pub async fn download(
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Download a single byte-range segment, writing directly to `file` at the
-/// correct offset. Updates `state` after every chunk so progress is resumable.
-/// If `progress_tx` is provided, sends byte-count deltas after each write.
+/// Download a single byte-range segment.
+///
+/// Each segment opens its **own** file handle wrapped in a
+/// [`BufWriter`] (256 KiB buffer). It seeks once to the resume
+/// offset, then writes sequentially — the ideal access pattern for
+/// buffered I/O. This eliminates all file-level mutex contention
+/// between segments.
 async fn download_segment(
     client: &Client,
     url: &str,
-    file: &Arc<Mutex<File>>,
+    filepath: &Path,
     state: &Arc<Mutex<DownloadState>>,
     seg: &SegmentState,
     index: usize,
@@ -457,6 +462,17 @@ async fn download_segment(
     let resume_from = seg.resume_offset();
     let range_header = format!("bytes={}-{}", resume_from, seg.end);
 
+    // --- Open a dedicated file handle for this segment --------------------
+    let raw = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(filepath)
+        .await?;
+    let mut writer = BufWriter::with_capacity(WRITE_BUFFER_SIZE, raw);
+
+    // Seek once to the resume offset; subsequent writes are sequential.
+    writer.seek(std::io::SeekFrom::Start(resume_from)).await?;
+
+    // --- HTTP range request -----------------------------------------------
     let response = client
         .get(url)
         .header(reqwest::header::RANGE, &range_header)
@@ -465,7 +481,6 @@ async fn download_segment(
         .error_for_status()?;
 
     let mut stream = response.bytes_stream();
-    let mut offset = resume_from;
 
     loop {
         tokio::select! {
@@ -473,7 +488,8 @@ async fn download_segment(
 
             // Check cancellation first.
             _ = cancel.cancelled() => {
-                // Save progress before returning.
+                // Flush buffered data so saved state matches what's on disk.
+                writer.flush().await?;
                 let st = state.lock().await;
                 let _ = st.save();
                 pb.abandon_with_message(format!("{} ⏸", index + 1));
@@ -483,15 +499,10 @@ async fn download_segment(
             chunk_opt = stream.next() => {
                 match chunk_opt {
                     Some(Ok(chunk)) => {
-                        // Write to file at the correct offset.
-                        {
-                            let mut f = file.lock().await;
-                            f.seek(std::io::SeekFrom::Start(offset)).await?;
-                            f.write_all(&chunk).await?;
-                        }
-
                         let len = chunk.len() as u64;
-                        offset += len;
+
+                        // Write into the BufWriter (no mutex needed).
+                        writer.write_all(&chunk).await?;
 
                         // Update segment state.
                         {
@@ -507,7 +518,8 @@ async fn download_segment(
                         pb.inc(len);
                     }
                     Some(Err(e)) => {
-                        // Save progress before propagating.
+                        // Flush what we have so progress isn't lost.
+                        let _ = writer.flush().await;
                         let st = state.lock().await;
                         let _ = st.save();
                         pb.abandon_with_message(format!("{} ✗", index + 1));
@@ -522,6 +534,8 @@ async fn download_segment(
         }
     }
 
+    // Flush remaining buffered bytes to disk.
+    writer.flush().await?;
     pb.finish_with_message(format!("{} ✓", index + 1));
     Ok(())
 }
